@@ -27,8 +27,9 @@ MCHPRS_IO 保留了 MCHPRS 面向计算红石的全部核心能力：
 
 - Minecraft 1.20.4 创造模式多线程红石服务器
 - Redpiler 红石编译器
-- 自动化协议（TCP 25585 端口，明文，协议版本 0.3.0-beta）：
-  - `PIN` / `POUT` 数据端口，把红石区域以十六进制值对外暴露
+- 自动化协议（TCP 25585 端口，明文，协议版本 0.4.0-beta）：
+  - `PIN` / `POUT` 数据端口，把红石区域以十六进制值对外暴露；十六进制表示
+    是整条位向量当作一个整数、在前面补零（0.4.0-beta 起变更）
   - `INPUT` / `OUTPUT` 读写端口数值
   - `EVENT` 推送，把变化通知给订阅方
   - 端口名大小写敏感，按注册名原样推送
@@ -37,10 +38,12 @@ MCHPRS_IO 保留了 MCHPRS 面向计算红石的全部核心能力：
 - **无人值守**：没有玩家在线时电路照常运行，适合脚本挂机跑电路
 - **单地皮 + 空岛模型**：只保留 `p0,0`，其余地皮永不加载
 - **编译崩溃可控**：先保存地皮存档、打印 `[CRASH]`，再以退出码 1 退出
-- **空容器不中止编译**：改为黄色警告 + 按 0 处理
+- **空容器不中止编译**：按 0 处理，并把全部位置合并成一条红色警告
+- **文件存储器**：`memory/*.rom.txt` 只读 ROM，`memory/*.ram.txt` 可写 RAM
+  （Logisim `v3.0 hex words addressed`），由红石地址线、时钟线与使能线驱动
 - WorldEdit 风格建筑指令、Velocity 转发、LuckPerms 支持
 
-## 运行模型（0.3.0-beta）
+## 运行模型（0.4.0-beta）
 
 ### 只有一块地皮
 
@@ -67,6 +70,7 @@ MCHPRS_IO 保留了 MCHPRS 面向计算红石的全部核心能力：
 | `/radvance <ticks>` | 手动推进 tick |
 | `/toggleautorp` | 切换自动编译 |
 | `/worldsendrate <hz>` | 设置方块更新频率 |
+| `/memory reload` | 从磁盘重读 `memory/*.rom.txt` |
 | `/stop` | 关闭服务器 |
 
 成功回 `OK CMD`；失败回 `ERR CMD <INACTIVE|UNKNOWN|ARG>`。命令自身的聊天输出
@@ -86,8 +90,94 @@ redpiler 编译过程中发生不可恢复错误时，服务器会**先保存该
 ### 空容器
 
 比较器读到空容器（空锅 / 空木桶 / 空熔炉 / 空漏斗 / 空堆肥桶）**不再中止编译**：
-该方块按 0 参与编译，并在触发编译的玩家聊天窗里发一条**黄色警告**。服务器没有
-规则的方块（`Unsupported`）仍会中止编译。
+该方块按 0 参与编译，并在触发编译的玩家聊天窗里发**一条红色警告**，列出全部受
+影响的位置，例如：
+
+```text
+Redpiler compile warning: comparator at (143,89,367),(126,69,127) reads some empty containers
+```
+
+只列前 10 个位置，后面接 `,(...)`。服务器没有规则的方块（`Unsupported`）仍会
+中止编译。
+
+### 内存文件（ROM 与 RAM）
+
+存储器用文本文件定义，放在与 `Config.toml` 同级的 `memory/` 目录里。
+`*.rom.txt` 是只读的 ROM，`*.ram.txt` 是可写的 RAM；启动时加载该目录下所有
+文件。
+
+```text
+v0.4.1-beta hex words addressed
+origin = 0
+clk = 0
+address coordinate = [
+-8, 64, 0
+-7, 64, 0
+]
+data coordinate = [
+2, 64, 0
+3, 64, 0
+]
+00: 0f 3c 69 96
+```
+
+- 首行必须与当前内核版本一致，否则整份文件被拒载。
+- `clk = 0` 表示**没有时钟**：地址值一变就重写数据总线。`clk = x, y, z`
+  表示该元件的每个上升沿读一次。
+- `origin = 0`（或 `0, 0, 0`）表示坐标就是世界绝对坐标；其它三元组会加到
+  所有坐标上，`clk` 也算。键的顺序任意。
+- `address coordinate` 必须是红石灯 / 活板门 / 音符盒；`data coordinate`
+  必须是拉杆 / 踩踏板。两组列表的第一个元素都是**最高位**，位宽不要求是 4 的
+  倍数。
+- 数据区是 Logisim 的 `v3.0 hex words addressed` 格式：`地址: word word ...`。
+  word 之间用空格或换行分隔，`#` / `//` / `/* */` 注释处处可用，未列出的地址
+  读作 0，比数据总线宽的 word 只取低位。
+- 每次编译成功后逐条校验：坐标解析不出的那一条被禁用并给出红色聊天提示，其余
+  照常工作。读写都在 tick 之后执行，因此固定有 **1 tick 延迟**。
+- data 拉杆与 address / 时钟元件**面贴面相邻**会被拒载：那等于用自己的输出去
+  驱动自己读的信号（1 tick 反馈环）。经红石线的间接耦合不检测。
+- 多条存储器可以共用地址线与数据线；共用**时钟**元件则两块一起失效。
+- `/memory reload` 无需重启即可重读 `memory/`，玩家和脚本（`/` 行）都能发。
+
+### 可写存储器（`*.ram.txt`）
+
+RAM 的内容保存在服务器内存里，并写回同一个文件。
+
+```text
+v0.4.1-beta hex words addressed
+origin = 0
+clk = 12, 37, 76                  // 必须存在，同时驱动读和写
+write enable = 43, 46, 25
+read enable = 81, 66, 48
+byte write enable = [             // 空列表 = 整字写入
+26, 67, 94
+26, 67, 97
+]
+address coordinate = [
+258, 10, 263
+258, 8, 263
+]
+write data coordinate = [         // 电路驱动（灯）
+256, 14, 264
+256, 12, 264
+]
+read data coordinate = [          // 服务器驱动（拉杆）
+256, 34, 264
+256, 32, 264
+]
+00: f b
+```
+
+- 时钟必须存在，同时驱动读和写；所有信号在上升沿锁存，因此读写都有 1 tick
+  延迟。
+- `write data coordinate` 与 `read data coordinate` 必须是**两组不同的方块**，
+  位宽必须相等。
+- 字节写使能从最高位开始每 8 位一组：共 `ceil(N/8)` 条，第 1 条管最高组，
+  **最后一条永远管低 8 位**。使能为 1 的组写入新值，为 0 的组保持原值。
+- 读优先：同一个沿上读写使能同时有效时，读数据线输出**旧值**，写入照常进行。
+- 内容会写回同一个文件（保留头部与注释，首行更新为当前版本）：每 2 秒或每
+  4096 次写入落盘一次，`/stop`、编译崩溃、`/memory reload` 之前强制落盘。
+- 读数据拉杆不能被电路驱动，否则会和存储器互相覆盖；校验时会检查。
 
 ## 快速开始
 
@@ -115,7 +205,7 @@ python3 MCHPRS_IO/test.py
 演示会通过自动化协议注册一个 8 位加法器（`PIN add_in` 输入端口、`POUT add_out` 输出端口）并逐组验证，你会看到类似输出：
 
 ```text
-<- HELLO MCHPRS AUTOMATION 0.3.0-beta
+<- HELLO MCHPRS AUTOMATION 0.4.0-beta
 [25] passed=25 failed=0 rate=10/s
 ...
 done. total=500 passed=500 failed=0 elapsed=50.1s rate=10/s
@@ -187,11 +277,12 @@ done. total=500 passed=500 failed=0 elapsed=50.1s rate=10/s
 | `/gamemode <mode>` | `/gmc`、`/gmsp` | 切换游戏模式 |
 | `/plot claim` | `/p c` | 认领所在的地块 |
 | `/plot auto` | `/p a` | 自动寻找并认领空闲地块 |
+| `/memory reload` | — | 从 `memory/` 重读内存定义 |
 | `/stop` | — | 停止服务器 |
 
 其中 `/redpiler compile`、`/redpiler reset`、`/radvance`、`/toggleautorp`、
-`/worldsendrate`、`/stop` 也可以由自动化脚本以 `/` 开头的行发送，无需玩家在线
-（见上文「运行模型」）。
+`/worldsendrate`、`/memory reload`、`/stop` 也可以由自动化脚本以 `/` 开头的行
+发送，无需玩家在线（见上文「运行模型」）。
 
 > **注意**：本版只运行 `p0,0`，因此依赖「切换地块」的命令（`/plot auto`、
 > `/plot visit`、`/plot claim` 等）不会把玩家送到别的地皮——那些地皮永不加载。

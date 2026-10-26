@@ -338,6 +338,17 @@ impl JITBackend for DirectBackend {
         }
     }
 
+    fn has_inputs(&self, pos: BlockPos) -> Option<bool> {
+        let node_id = *self.pos_map.get(&pos)?;
+        for node in self.nodes.inner() {
+            let links = self.forward_links.get(&node.fwd_link_range);
+            if links.iter().any(|link| link.node().index() == node_id.index()) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     fn try_set_powered(&mut self, pos: BlockPos, powered: bool) -> bool {
         let Some(&node_id) = self.pos_map.get(&pos) else {
             return false;

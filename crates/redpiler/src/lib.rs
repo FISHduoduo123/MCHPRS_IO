@@ -272,6 +272,15 @@ impl Compiler {
         self.backend.as_ref()?.query_io(pos)
     }
 
+    /// Whether the compiled graph can drive the node at `pos`. `None` when the
+    /// compiler is inactive or nothing is compiled at `pos`.
+    pub fn has_inputs(&self, pos: BlockPos) -> Option<bool> {
+        if !self.is_active {
+            return None;
+        }
+        self.backend.as_ref()?.has_inputs(pos)
+    }
+
     /// Triggers a button pulse or lever toggle at `pos` on behalf of the
     /// automation bridge. Returns `false` when the compiler is inactive or no
     /// button/lever node exists at `pos`.

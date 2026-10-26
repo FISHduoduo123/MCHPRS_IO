@@ -287,6 +287,13 @@ impl Plot {
                 self.publish_world();
                 Ok(())
             }
+            "memory" => match args.first().copied() {
+                Some("reload") | Some("r") => {
+                    let _ = self.reload_memories();
+                    Ok(())
+                }
+                _ => Err("ARG"),
+            },
             "toggleautorp" => {
                 self.auto_redpiler = !self.auto_redpiler;
                 Ok(())
@@ -584,6 +591,31 @@ impl Plot {
                 self.players[player]
                     .send_system_message("The world send rate was successfully set.");
             }
+            "memory" => {
+                match args.first().copied() {
+                    Some("reload") => {
+                        let (loaded, active, rejected) = self.reload_memories();
+                        self.players[player].send_system_message(&format!(
+                            "Reloaded {} memory definition(s), {} active.",
+                            loaded, active
+                        ));
+                        // Files that failed to load would otherwise only show
+                        // up in the log (BACKLOG.md BUG-021).
+                        for message in rejected.iter().take(5) {
+                            self.players[player].send_error_message(message);
+                        }
+                        if rejected.len() > 5 {
+                            self.players[player].send_error_message(&format!(
+                                "...and {} more rejected file(s), see the log.",
+                                rejected.len() - 5
+                            ));
+                        }
+                    }
+                    _ => self
+                        .players[player]
+                        .send_error_message("Usage: /memory reload"),
+                }
+            }
             "version" => {
                 self.players[player].send_system_message(&get_version_string());
             }
@@ -616,6 +648,7 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 flags: CommandFlags::ROOT.bits() as i8,
                 children: vec![
                     1, 4, 5, 6, 8, 10, 11, 13, 18, 34, 41, 43, 44, 45, 49, 51, 52, 53, 55, 56,
+                    57,
                 ],
                 redirect_node: None,
                 name: None,
@@ -1129,6 +1162,24 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 children: vec![],
                 redirect_node: None,
                 name: Some("gmsp"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 57: /memory
+            Node {
+                flags: CommandFlags::LITERAL.bits() as i8,
+                children: vec![58],
+                redirect_node: None,
+                name: Some("memory"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 58: /memory reload
+            Node {
+                flags: (CommandFlags::LITERAL | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("reload"),
                 parser: None,
                 suggestions_type: None,
             },

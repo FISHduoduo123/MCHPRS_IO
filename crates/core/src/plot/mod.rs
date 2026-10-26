@@ -10,6 +10,7 @@ use crate::automation::{AutomationRequest, AutomationResponse, DataPort};
 use crate::config::CONFIG;
 use crate::interaction;
 use crate::interaction::UseOnBlockContext;
+use crate::memory::{self, MemoryState};
 use crate::player::{EntityId, Gamemode, PacketSender, Player, PlayerPos};
 use crate::server::{BroadcastMessage, Message, PrivMessage};
 use crate::utils::HyphenatedUUID;
@@ -70,6 +71,10 @@ pub struct Plot {
     pub players: Vec<Player>,
     pub redpiler: Compiler,
 
+    /// File-backed read-only memories (BACKLOG.md BUG-015), loaded from
+    /// `memory/*.rom.txt` and re-validated after every successful compile.
+    memories: Vec<MemoryState>,
+
     // Thread communication
     message_receiver: BusReader<BroadcastMessage>,
     message_sender: Sender<Message>,
@@ -125,19 +130,51 @@ struct PlotDataPort {
 }
 
 /// Packs a bit vector (bit 0 = most significant bit) into hex (lower-case
-/// digits), right-padding the final nibble with zeroes. Mirrors the unpacking
-/// in [`crate::automation`]'s `INPUT` parser, which accepts both cases.
+/// digits). The vector is treated as one unsigned integer, so a width that is
+/// not a multiple of four is zero-padded at the *front* of the whole value
+/// (BACKLOG.md BUG-016). Mirrors the unpacking in [`crate::automation`]'s
+/// `INPUT` parser.
 fn pack_hex(bits: &[bool]) -> String {
     let mut hex = String::with_capacity((bits.len() + 3) / 4);
-    for chunk in bits.chunks(4) {
+    let mut index = 0;
+    // The leading nibble holds only the leftover bits, so the padding ends up
+    // at the most significant end of the value.
+    let leftover = bits.len() % 4;
+    if leftover != 0 {
         let mut value = 0u8;
-        for bit in chunk {
+        for bit in &bits[..leftover] {
             value = (value << 1) | u8::from(*bit);
         }
-        value <<= 4 - chunk.len();
         hex.push(char::from_digit(u32::from(value), 16).unwrap());
+        index = leftover;
+    }
+    while index < bits.len() {
+        let mut value = 0u8;
+        for bit in &bits[index..index + 4] {
+            value = (value << 1) | u8::from(*bit);
+        }
+        hex.push(char::from_digit(u32::from(value), 16).unwrap());
+        index += 4;
     }
     hex
+}
+
+/// Formats the empty-container compile warning (BACKLOG.md BUG-014): one red
+/// message listing every affected comparator position, at most ten of them.
+fn format_empty_container_warning(positions: &[BlockPos]) -> String {
+    const MAX_LISTED: usize = 10;
+    let mut message = String::from("Redpiler compile warning: comparator at ");
+    for (index, pos) in positions.iter().take(MAX_LISTED).enumerate() {
+        if index > 0 {
+            message.push(',');
+        }
+        message.push_str(&format!("({},{},{})", pos.x, pos.y, pos.z));
+    }
+    if positions.len() > MAX_LISTED {
+        message.push_str(",(...)");
+    }
+    message.push_str(" reads some empty containers");
+    message
 }
 
 pub struct PlotWorld {
@@ -916,6 +953,73 @@ impl Plot {
         Ok(())
     }
 
+    /// Advances every active memory by one sample. Called right after the
+    /// tick so the address reflects the state that tick produced.
+    fn run_memories(&mut self) {
+        if self.memories.is_empty() {
+            return;
+        }
+        for state in &mut self.memories {
+            state.sample(&mut self.redpiler);
+        }
+        // Writable memories persist themselves every so often (BACKLOG.md
+        // BUG-021): a few seconds or a few thousand writes, whichever first.
+        for state in &mut self.memories {
+            if state.flush_due() {
+                if let Err(err) = state.save() {
+                    warn!("{}", err);
+                }
+            }
+        }
+    }
+
+    /// Forces every dirty memory to disk. Used on shutdown, on a compile crash
+    /// and before `/memory reload`.
+    fn flush_memories(&mut self) {
+        for state in &mut self.memories {
+            if state.is_dirty() {
+                if let Err(err) = state.save() {
+                    warn!("{}", err);
+                }
+            }
+        }
+    }
+
+    /// Validates every memory against the freshly compiled graph. A memory that
+    /// does not match is disabled and reported; the others keep working
+    /// (BACKLOG.md BUG-015).
+    fn validate_memories(&mut self, source: Option<usize>) {
+        for state in &mut self.memories {
+            state.reset_edges();
+            match state.memory.validate(&self.redpiler) {
+                Ok(()) => state.active = true,
+                Err(invalid) => {
+                    state.active = false;
+                    let message = memory::describe_invalid(&state.memory, &invalid);
+                    warn!("{}", message);
+                    if let Some(player) = source {
+                        self.players[player].send_error_message(&message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-reads `memory/*.rom.txt` from disk and re-validates every definition.
+    /// Returns `(loaded, active)` (BACKLOG.md BUG-015).
+    fn reload_memories(&mut self) -> (usize, usize, Vec<String>) {
+        // Unsaved RAM contents are written first so a reload cannot lose them.
+        self.flush_memories();
+        let report = memory::load_all(Path::new(memory::MEMORY_DIR));
+        self.memories = report.memories;
+        if self.redpiler.is_active() {
+            self.validate_memories(None);
+        }
+        let loaded = self.memories.len();
+        let active = self.memories.iter().filter(|state| state.active).count();
+        (loaded, active, report.rejected)
+    }
+
     fn publish_world(&mut self) {
         if self.redpiler.is_active() {
             self.redpiler.flush(&mut self.world);
@@ -973,18 +1077,25 @@ impl Plot {
                 self.scoreboard
                     .set_redpiler_state(&self.players, RedpilerState::Running);
                 self.reset_timings();
-                // The compile succeeded, but an empty container may have been
-                // read as 0 (BACKLOG.md BUG-001 revision). Warn the player who
-                // started the compile; automatic compiles stay silent.
-                if let (Some(player), Some(OverrideError::EmptyContainer { pos, kind })) =
-                    (source, monitor.warning())
-                {
-                    let message = format!(
-                        "Redpiler compile warning: comparator at {} reads an empty {}",
-                        pos, kind
-                    );
-                    self.players[player].send_system_message(&message);
+                // The compile succeeded, but empty containers may have been
+                // read as 0 (BACKLOG.md BUG-001 revision, BUG-014). Report every
+                // distinct position to the player who started the compile;
+                // automatic compiles stay silent.
+                if let Some(player) = source {
+                    let positions: Vec<BlockPos> = monitor
+                        .warnings()
+                        .into_iter()
+                        .filter_map(|warning| match warning {
+                            OverrideError::EmptyContainer { pos, .. } => Some(pos),
+                            _ => None,
+                        })
+                        .collect();
+                    if !positions.is_empty() {
+                        let message = format_empty_container_warning(&positions);
+                        self.players[player].send_error_message(&message);
+                    }
                 }
+                self.validate_memories(source);
             }
             Ok(Err(CompileError::Override(error))) => {
                 self.scoreboard
@@ -1018,6 +1129,9 @@ impl Plot {
             Err(payload) => {
                 let reason = panic_payload_message(payload.as_ref());
                 let saved_to = self.crash_save();
+                // RAM contents are persisted by their own files, so a crash
+                // must not lose them (BACKLOG.md BUG-021).
+                self.flush_memories();
                 error!(
                     "[CRASH] plot ({}, {}) redpiler panic: {} — saved to {} — exiting with code 1",
                     self.world.x, self.world.z, reason, saved_to
@@ -1319,6 +1433,7 @@ impl Plot {
                         player.save();
                         player.kick("Server closed".into());
                     }
+                    self.flush_memories();
                     self.always_running = false;
                     self.running = false;
                     return;
@@ -1478,6 +1593,7 @@ impl Plot {
                             self.tickn(1);
                             self.sample_sub_watches();
                             self.sample_pout_ports();
+                            self.run_memories();
                         }
                         self.redpiler.flush(&mut self.world);
                         // Flush-time IO events duplicate the per-tick
@@ -1497,6 +1613,10 @@ impl Plot {
                         // tick boundary as the drained events so `output`
                         // lines carry the state of this tick.
                         self.sample_pout_ports();
+                        // Read the address bus and rewrite the data bus at the
+                        // same boundary (BACKLOG.md BUG-015), so a memory has a
+                        // fixed one tick latency.
+                        self.run_memories();
                     }
                 } else {
                     for i in 0..batch_size {
@@ -1628,6 +1748,13 @@ impl Plot {
             tps,
             always_running,
             redpiler: Default::default(),
+            memories: {
+                let report = memory::load_all(Path::new(memory::MEMORY_DIR));
+                for message in &report.rejected {
+                    warn!("{}", message);
+                }
+                report.memories
+            },
             timings: TimingsMonitor::new(tps),
             owner: database::get_plot_owner(x, z).map(|s| s.parse::<HyphenatedUUID>().unwrap().0),
             async_rt: Plot::create_async_rt(),
@@ -1778,6 +1905,8 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 impl Drop for Plot {
     fn drop(&mut self) {
+        // Last chance to persist writable memories (BACKLOG.md BUG-021).
+        self.flush_memories();
         if !self.players.is_empty() {
             for player in &mut self.players {
                 player.save(); // just in case

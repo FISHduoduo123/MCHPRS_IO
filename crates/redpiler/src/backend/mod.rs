@@ -79,6 +79,10 @@ pub trait JITBackend {
     /// Sets the absolute state of a lever or pressure plate at `pos`.
     /// Returns `false` when there is no lever/pressure plate node at `pos`.
     fn try_set_powered(&mut self, pos: BlockPos, powered: bool) -> bool;
+    /// Whether anything in the compiled graph can drive the node at `pos`,
+    /// i.e. whether any forward link points at it. `None` when there is no
+    /// node there. Used to tell a memory's output levers from driven ones.
+    fn has_inputs(&self, pos: BlockPos) -> Option<bool>;
     /// Drains all pending IO state change events.
     fn take_io_events(&mut self) -> Vec<IoEvent>;
 }

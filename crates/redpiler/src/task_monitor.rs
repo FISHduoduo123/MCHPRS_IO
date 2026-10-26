@@ -9,10 +9,10 @@ pub struct TaskMonitor {
     progress: AtomicUsize,
     message: Mutex<Option<Arc<String>>>,
     error: Mutex<Option<OverrideError>>,
-    /// Non-fatal problem worth telling the player about. Recorded for empty
+    /// Non-fatal problems worth telling the player about. Recorded for empty
     /// containers, whose comparator output is treated as 0 instead of aborting
-    /// the compile.
-    warning: Mutex<Option<OverrideError>>,
+    /// the compile. Every distinct position is kept (BACKLOG.md BUG-014).
+    warnings: Mutex<Vec<OverrideError>>,
 }
 
 impl TaskMonitor {
@@ -39,17 +39,27 @@ impl TaskMonitor {
         *self.error.lock().unwrap()
     }
 
-    /// Records a non-fatal problem. Like [`Self::set_error`], only the first
-    /// one is kept: it is the earliest position and the useful one to report.
+    /// Records a non-fatal problem. Unlike [`Self::set_error`], every distinct
+    /// position is kept so one compile can report all of them at once
+    /// (BACKLOG.md BUG-014). Duplicates of the same position are collapsed.
     pub fn set_warning(&self, warning: OverrideError) {
-        let mut slot = self.warning.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(warning);
+        let mut warnings = self.warnings.lock().unwrap();
+        let pos = match warning {
+            OverrideError::EmptyContainer { pos, .. } => pos,
+            OverrideError::Unsupported { pos, .. } => pos,
+        };
+        let already_known = warnings.iter().any(|known| match known {
+            OverrideError::EmptyContainer { pos: known, .. } => *known == pos,
+            OverrideError::Unsupported { pos: known, .. } => *known == pos,
+        });
+        if !already_known {
+            warnings.push(warning);
         }
     }
 
-    pub fn warning(&self) -> Option<OverrideError> {
-        *self.warning.lock().unwrap()
+    /// Every recorded non-fatal problem, in the order they were found.
+    pub fn warnings(&self) -> Vec<OverrideError> {
+        self.warnings.lock().unwrap().clone()
     }
 
     pub fn set_progress(&self, progress: usize) {

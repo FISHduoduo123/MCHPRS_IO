@@ -27,8 +27,10 @@ The `MCHPRS_IO/` folder in this repository contains a complete, ready-to-run dem
 
 - Multithreaded redstone server for Minecraft 1.20.4 creative mode
 - Redpiler redstone compiler
-- Automation protocol (TCP port 25585, plain text, protocol version 0.3.0-beta):
-  - `PIN` / `POUT` data ports expose redstone regions as hex values
+- Automation protocol (TCP port 25585, plain text, protocol version 0.4.0-beta):
+  - `PIN` / `POUT` data ports expose redstone regions as hex values; the
+    hex is the whole bit vector as one integer, zero-padded at the front
+    (changed in 0.4.0-beta)
   - `INPUT` / `OUTPUT` read and write port values
   - `EVENT` pushes notify subscribers of changes
   - Port names are case-sensitive and pushed exactly as registered
@@ -39,10 +41,14 @@ The `MCHPRS_IO/` folder in this repository contains a complete, ready-to-run dem
 - **Single plot, skyblock-style**: only `p0,0` exists; no other plot is loaded
 - **Controlled crash handling**: a compile crash saves the plot, logs `[CRASH]`
   and exits with code 1
-- **Empty containers no longer abort a compile**: they warn and compile as 0
+- **Empty containers no longer abort a compile**: they compile as 0 and
+  every affected position is reported in one red warning
+- **File-backed memories**: read-only ROMs from `memory/*.rom.txt` and
+  writable RAMs from `memory/*.ram.txt` (Logisim `v3.0 hex words addressed`),
+  driven by redstone address, clock and enable lines
 - WorldEdit-style building commands, Velocity ip-forwarding, LuckPerms support
 
-## Runtime Model (0.3.0-beta)
+## Runtime Model (0.4.0-beta)
 
 ### A single plot
 
@@ -74,6 +80,7 @@ relative coordinates (`~` / `^`) are rejected. Supported commands:
 | `/radvance <ticks>` | Advance the plot by N ticks |
 | `/toggleautorp` | Toggle automatic compilation |
 | `/worldsendrate <hz>` | Set the world send rate |
+| `/memory reload` | Re-read `memory/*.rom.txt` from disk |
 | `/stop` | Shut the server down |
 
 Success replies `OK CMD`; failure replies `ERR CMD <INACTIVE|UNKNOWN|ARG>`. The
@@ -96,8 +103,107 @@ and terminates with exit code **1**.
 
 A comparator reading an empty container (empty cauldron / barrel / furnace /
 hopper / composter) **no longer aborts the compile**: that block is compiled as 0
-and the player who started the compile receives a **yellow warning**. Blocks the
-server has no rule for (`Unsupported`) still abort the compile.
+and the player who started the compile receives **one red warning** listing every
+affected position, for example:
+
+```text
+Redpiler compile warning: comparator at (143,89,367),(126,69,127) reads some empty containers
+```
+
+Only the first ten positions are listed, followed by `,(...)`. Blocks the server
+has no rule for (`Unsupported`) still abort the compile.
+
+### Memory files (ROM and RAM)
+
+A memory is defined by a text file in `memory/`, next to `Config.toml`.
+`*.rom.txt` files are read-only, `*.ram.txt` files are writable. Every file in
+that directory is loaded at startup.
+
+```text
+v0.4.1-beta hex words addressed
+origin = 0
+clk = 0
+address coordinate = [
+-8, 64, 0
+-7, 64, 0
+]
+data coordinate = [
+2, 64, 0
+3, 64, 0
+]
+00: 0f 3c 69 96
+```
+
+- The first line must name the running kernel version, otherwise the file is
+  rejected.
+- `clk = 0` means **no clock**: the data bus is rewritten whenever the address
+  value changes. `clk = x, y, z` reads once per rising edge of that element.
+- `origin = 0` (or `0, 0, 0`) keeps coordinates absolute; any other triple is
+  added to every coordinate, `clk` included. Keys may appear in any order.
+- `address coordinate` entries must be redstone lamps, trapdoors or note
+  blocks; `data coordinate` entries must be levers or pressure plates. The
+  first entry of each list is the **most significant** bit; bus width is not
+  limited to a multiple of four.
+- The payload is the Logisim `v3.0 hex words addressed` format: `addr: word
+  word ...`. Words are separated by spaces or newlines, `#` / `//` / `/* */`
+  comments are accepted everywhere, unlisted addresses read as 0, and a word
+  wider than the data bus keeps its low bits.
+- A memory is validated after every successful compile. A memory whose
+  coordinates do not resolve is disabled with a red chat message; the others
+  keep running. Reads and writes happen right after a tick, so a memory has a
+  fixed **one tick latency**.
+- A data lever that shares a face with an address or clock element is rejected:
+  it would drive the very signal the memory reads (a one tick feedback loop).
+  Indirect coupling through wires is not detected.
+- Two memories may share address and data lines; a shared **clock** element
+  disables both.
+- `/memory reload` re-reads `memory/` without restarting the server. It can be
+  typed by a player or sent by a script as a `/` line.
+
+### Writable memories (`*.ram.txt`)
+
+A RAM keeps its contents in the server and writes them back to the same file.
+
+```text
+v0.4.1-beta hex words addressed
+origin = 0
+clk = 12, 37, 76                  // mandatory; drives both read and write
+write enable = 43, 46, 25
+read enable = 81, 66, 48
+byte write enable = [             // empty list = write the whole word
+26, 67, 94
+26, 67, 97
+]
+address coordinate = [
+258, 10, 263
+258, 8, 263
+]
+write data coordinate = [         // driven by the circuit (lamps)
+256, 14, 264
+256, 12, 264
+]
+read data coordinate = [          // driven by the server (levers)
+256, 34, 264
+256, 32, 264
+]
+00: f b
+```
+
+- The clock is mandatory and drives both halves. Everything is latched on its
+  rising edge, so a read or a write lands one tick later.
+- `write data coordinate` and `read data coordinate` must be different blocks
+  with the same width.
+- Byte write enables are grouped from the most significant end, eight bits at a
+  time: `ceil(N/8)` entries, the first entry covers the most significant group
+  and the last one always covers the low 8 bits. An enabled group takes the new
+  bits, a disabled group keeps the old value.
+- Read priority: when read and write enable are both high on the same edge, the
+  read data bus carries the **old** word while the write is applied.
+- Contents are written back to the same file (header and comments preserved,
+  first line updated to the running version) every two seconds or every 4096
+  writes, and on `/stop`, on a compile crash and before `/memory reload`.
+- A read data lever must not be driven by the circuit: the memory would fight
+  it. This is checked when the memory is validated.
 
 ## Quick Start
 
@@ -125,7 +231,7 @@ python3 MCHPRS_IO/test.py
 The demo registers an 8-bit adder (`PIN add_in` input port, `POUT add_out` output port) over the automation protocol and verifies it against input vectors. You will see output like:
 
 ```text
-<- HELLO MCHPRS AUTOMATION 0.3.0-beta
+<- HELLO MCHPRS AUTOMATION 0.4.0-beta
 [25] passed=25 failed=0 rate=10/s
 ...
 done. total=500 passed=500 failed=0 elapsed=50.1s rate=10/s
@@ -197,11 +303,12 @@ Velocity ip-forwarding and LuckPerms are supported; see the upstream README for 
 | `/gamemode <mode>` | `/gmc`, `/gmsp` | Set gamemode |
 | `/plot claim` | `/p c` | Claim the plot you are in |
 | `/plot auto` | `/p a` | Automatically find and claim a free plot |
+| `/memory reload` | — | Re-read the memory definitions from `memory/` |
 | `/stop` | — | Stop the server |
 
 `/redpiler compile`, `/redpiler reset`, `/radvance`, `/toggleautorp`,
-`/worldsendrate` and `/stop` can also be sent by an automation script as `/`
-lines, with no player online (see "Runtime Model" above).
+`/worldsendrate`, `/memory reload` and `/stop` can also be sent by an automation
+script as `/` lines, with no player online (see "Runtime Model" above).
 
 > **Note**: this build runs only `p0,0`, so commands that rely on switching
 > plots (`/plot auto`, `/plot visit`, `/plot claim`, ...) cannot move a player

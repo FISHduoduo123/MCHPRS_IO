@@ -551,7 +551,7 @@ impl AutomationServer {
                     );
                     self.watches.insert(conn_id, FxHashSet::default());
                     self.data_ports.insert(conn_id, FxHashMap::default());
-                    self.queue_line(conn_id, "HELLO MCHPRS AUTOMATION 0.3.0-beta\n".to_string());
+                    self.queue_line(conn_id, "HELLO MCHPRS AUTOMATION 0.4.0-beta\n".to_string());
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return,
                 Err(e) => {
@@ -872,12 +872,19 @@ fn parse_hex_bits(hex: &str, port: &DataPort) -> Option<Vec<bool>> {
         return None;
     }
     let mut bits = Vec::with_capacity(port.n_points());
-    for c in hex.chars() {
+    let leftover = port.n_points() % 4;
+    for (index, c) in hex.chars().enumerate() {
         let value = c.to_digit(16)? as u8;
-        for shift in (0..4).rev() {
-            if bits.len() < port.n_points() {
-                bits.push(value & (1 << shift) != 0);
-            }
+        // The packed state is one unsigned integer (BACKLOG.md BUG-016), so the
+        // first nibble holds only the leftover high bits: its leading zeros are
+        // padding and must be skipped.
+        let width = if index == 0 && leftover != 0 {
+            leftover
+        } else {
+            4
+        };
+        for shift in (0..width).rev() {
+            bits.push(value & (1 << shift) != 0);
         }
     }
     Some(bits)
