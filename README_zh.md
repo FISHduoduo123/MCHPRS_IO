@@ -27,7 +27,7 @@ MCHPRS_IO 保留了 MCHPRS 面向计算红石的全部核心能力：
 
 - Minecraft 1.20.4 创造模式多线程红石服务器
 - Redpiler 红石编译器
-- 自动化协议（TCP 25585 端口，明文，协议版本 0.4.0-beta）：
+- 自动化协议（TCP 25585 端口，明文，协议版本 0.4.3-beta）：
   - `PIN` / `POUT` 数据端口，把红石区域以十六进制值对外暴露；十六进制表示
     是整条位向量当作一个整数、在前面补零（0.4.0-beta 起变更）
   - `INPUT` / `OUTPUT` 读写端口数值
@@ -107,14 +107,16 @@ Redpiler compile warning: comparator at (143,89,367),(126,69,127) reads some emp
 文件。
 
 ```text
-v0.4.1-beta hex words addressed
+v0.4.3-beta hex words addressed
 origin = 0
 clk = 0
 address coordinate = [
+width = 2
 -8, 64, 0
 -7, 64, 0
 ]
 data coordinate = [
+width = 2
 2, 64, 0
 3, 64, 0
 ]
@@ -126,9 +128,20 @@ data coordinate = [
   表示该元件的每个上升沿读一次。
 - `origin = 0`（或 `0, 0, 0`）表示坐标就是世界绝对坐标；其它三元组会加到
   所有坐标上，`clk` 也算。键的顺序任意。
+- 每个列表的**第一项必须写 `width = N`**，声明该列表应展开出多少个坐标；
+  实际数量与 `width` 不符就整份拒载。方括号内写成空列表 `[ ]` 也是错的。
 - `address coordinate` 必须是红石灯 / 活板门 / 音符盒；`data coordinate`
   必须是拉杆 / 踩踏板。两组列表的第一个元素都是**最高位**，位宽不要求是 4 的
   倍数。
+- 一行可以是一个坐标 `x, y, z`，也可以是**步进展开**
+  `x, y, z, +2x, 4`：符号必须写，轴只能是 x / y / z 之一（大小写均可），
+  步长绝对值 1–255，数量 1–1024 且必须是纯数字。
+- `matrix: x, y, z, +1x, 3, +1y, 5` 支持最多三个方向一次性展开（行优先，
+  第一段变化最快），但写了 `matrix:` 的列表**只能占一行**。矩阵写法是逐行在
+  行首补零对齐 hex 的：每行补 `(4 - 第一段数量 % 4) % 4` 个零，所以每个字
+  的 hex 位数是 `ceil(第一段数量/4) × 其余段数量之积`。
+- 同一个存储器内任意两个 bit 落到同一坐标都会报错，错误里带行号、展开序号、
+  坐标和冲突行。
 - 数据区是 Logisim 的 `v3.0 hex words addressed` 格式：`地址: word word ...`。
   word 之间用空格或换行分隔，`#` / `//` / `/* */` 注释处处可用，未列出的地址
   读作 0，比数据总线宽的 word 只取低位。
@@ -144,39 +157,46 @@ data coordinate = [
 RAM 的内容保存在服务器内存里，并写回同一个文件。
 
 ```text
-v0.4.1-beta hex words addressed
+v0.4.3-beta hex words addressed
 origin = 0
 clk = 12, 37, 76                  // 必须存在，同时驱动读和写
 write enable = 43, 46, 25
 read enable = 81, 66, 48
-byte write enable = [             // 空列表 = 整字写入
+byte write enable = [             // 没有字节使能就写 width = 0
+width = 1
 26, 67, 94
-26, 67, 97
 ]
 address coordinate = [
+width = 2
 258, 10, 263
 258, 8, 263
 ]
 write data coordinate = [         // 电路驱动（灯）
+width = 2
 256, 14, 264
 256, 12, 264
 ]
 read data coordinate = [          // 服务器驱动（拉杆）
+width = 2
 256, 34, 264
 256, 32, 264
 ]
-00: f b
+0: 3 1 0 0 0 0 0 0
 ```
 
 - 时钟必须存在，同时驱动读和写；所有信号在上升沿锁存，因此读写都有 1 tick
   延迟。
 - `write data coordinate` 与 `read data coordinate` 必须是**两组不同的方块**，
   位宽必须相等。
-- 字节写使能从最高位开始每 8 位一组：共 `ceil(N/8)` 条，第 1 条管最高组，
-  **最后一条永远管低 8 位**。使能为 1 的组写入新值，为 0 的组保持原值。
+- 字节写使能列表的 `width` 必须等于 `ceil(N/8)`，写 `width = 0` 表示没有
+  字节使能（整字写入）。从最高位开始每 8 位一组，第 1 条管最高组，**最后一条
+  永远管低 8 位**。使能为 1 的组写入新值，为 0 的组保持原值。
 - 读优先：同一个沿上读写使能同时有效时，读数据线输出**旧值**，写入照常进行。
-- 内容会写回同一个文件（保留头部与注释，首行更新为当前版本）：每 2 秒或每
-  4096 次写入落盘一次，`/stop`、编译崩溃、`/memory reload` 之前强制落盘。
+- 内容会写回同一个文件（保留头部，首行更新为当前版本）。数据区与 Logisim
+  兼容：每行固定 8 个 word，行首地址按 8 对齐，并按地址总线宽度补足十六进制
+  位数；不含任何已存字的块整块省略（这些地址读作 0）。**运行期完全不写盘**，
+  只在五个时机落盘：有玩家退出服务器、退出服务器、`/redpiler reset`、编译
+  崩溃、`/memory reload` 之前。
 - 读数据拉杆不能被电路驱动，否则会和存储器互相覆盖；校验时会检查。
 
 ## 快速开始
@@ -205,7 +225,7 @@ python3 MCHPRS_IO/test.py
 演示会通过自动化协议注册一个 8 位加法器（`PIN add_in` 输入端口、`POUT add_out` 输出端口）并逐组验证，你会看到类似输出：
 
 ```text
-<- HELLO MCHPRS AUTOMATION 0.4.0-beta
+<- HELLO MCHPRS AUTOMATION 0.4.3-beta
 [25] passed=25 failed=0 rate=10/s
 ...
 done. total=500 passed=500 failed=0 elapsed=50.1s rate=10/s

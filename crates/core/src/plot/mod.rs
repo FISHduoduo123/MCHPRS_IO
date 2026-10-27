@@ -376,6 +376,38 @@ impl Plot {
         }
     }
 
+    /// Advances `ticks` ticks on behalf of `/radvance`.
+    ///
+    /// Mirrors the redpiler branch of [`Plot::update`]: ROM / RAM are driven by
+    /// the server and see **every** tick, while the script-facing `POUT` / `SUB`
+    /// sampling still follows `automation_per_tick_push` (BACKLOG.md BUG-027).
+    fn advance_ticks(&mut self, ticks: u64) {
+        if !self.redpiler.is_active() {
+            self.tickn(ticks);
+            self.publish_world();
+            return;
+        }
+        let per_tick_push = CONFIG.automation_per_tick_push;
+        for _ in 0..ticks {
+            self.tickn(1);
+            if per_tick_push {
+                self.sample_sub_watches();
+                self.sample_pout_ports();
+            }
+            self.run_memories();
+        }
+        self.redpiler.flush(&mut self.world);
+        let events = self.redpiler.take_io_events();
+        if !per_tick_push && !events.is_empty() {
+            let _ = self.message_sender.send(Message::IoEvents(events));
+        }
+        if !per_tick_push {
+            self.sample_pout_ports();
+        }
+        self.world.flush_block_changes();
+        self.last_world_send_time = Instant::now();
+    }
+
     fn tick(&mut self) {
         self.timings.tick();
         if self.redpiler.is_active() {
@@ -962,15 +994,10 @@ impl Plot {
         for state in &mut self.memories {
             state.sample(&mut self.redpiler);
         }
-        // Writable memories persist themselves every so often (BACKLOG.md
-        // BUG-021): a few seconds or a few thousand writes, whichever first.
-        for state in &mut self.memories {
-            if state.flush_due() {
-                if let Err(err) = state.save() {
-                    warn!("{}", err);
-                }
-            }
-        }
+        // RAM contents are only written back at explicit events (shutdown,
+        // /redpiler reset, a compile crash and /memory reload); the tick loop
+        // never touches the disk, so a large RAM cannot stall a tick
+        // (BACKLOG.md BUG-021 / BUG-026).
     }
 
     /// Forces every dirty memory to disk. Used on shutdown, on a compile crash
@@ -1262,6 +1289,10 @@ impl Plot {
     /// Redpiler needs to reset implicitly in the case of any block changes done by a player. This
     /// can be
     fn reset_redpiler(&mut self) {
+        // The circuit that drives the memories is about to disappear, so a RAM
+        // must not carry unsaved words into the next compile (BACKLOG.md
+        // BUG-021).
+        self.flush_memories();
         if self.redpiler.is_active() {
             debug!("Discarding redpiler");
             let bounds = self.world.get_corners();
@@ -1511,8 +1542,16 @@ impl Plot {
             }
             alive
         });
+        let had_disconnections = !disconnected_players.is_empty();
         for entity_id in disconnected_players {
             self.destroy_entity(entity_id);
+        }
+        // A player leaving is the natural end of a session: p0,0 never unloads
+        // (BUG-010), so `Drop` can never persist anything while the server
+        // keeps running. Writing the RAM contents back here replaces the old
+        // periodic flush entirely (BACKLOG.md BUG-021 rule 7b).
+        if had_disconnections {
+            self.flush_memories();
         }
     }
 
@@ -1600,7 +1639,14 @@ impl Plot {
                         // polling stream; drain and discard them.
                         self.redpiler.take_io_events();
                     } else {
-                        self.tickn(batch_size as u64);
+                        // ROM / RAM are managed by the server itself and must
+                        // see every tick, otherwise a lagging batch merges
+                        // clock edges and loses RAM writes (BACKLOG.md
+                        // BUG-027).
+                        for _ in 0..batch_size {
+                            self.tickn(1);
+                            self.run_memories();
+                        }
                         self.redpiler.flush(&mut self.world);
                         // Drain automation IO events every tick so scripts
                         // receive state changes promptly even when no player
@@ -1613,10 +1659,6 @@ impl Plot {
                         // tick boundary as the drained events so `output`
                         // lines carry the state of this tick.
                         self.sample_pout_ports();
-                        // Read the address bus and rewrite the data bus at the
-                        // same boundary (BACKLOG.md BUG-015), so a memory has a
-                        // fixed one tick latency.
-                        self.run_memories();
                     }
                 } else {
                     for i in 0..batch_size {

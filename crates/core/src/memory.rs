@@ -5,17 +5,25 @@
 //! same file syntax:
 //!
 //! ```text
-//! v0.4.1-beta hex words addressed
+//! v0.4.3-beta hex words addressed
 //! origin = 0
 //! clk = 0
 //! address coordinate = [
+//! width = 1
 //! -8, 64, 0
 //! ]
 //! data coordinate = [
-//! 2, 64, 0
+//! width = 3
+//! 2, 64, 0, +1x, 3
 //! ]
 //! 00: 0f 3c 69
 //! ```
+//!
+//! Every list starts with a mandatory `width = N` (BACKLOG.md BUG-023) and its
+//! coordinates expand to exactly that many points. A line is either a single
+//! point (`x, y, z`) or a step (`x, y, z, +2x, 4`); a `matrix:` line expands
+//! along up to three directions at once and pads each row at its front to a
+//! whole number of hex digits (BUG-022).
 //!
 //! A RAM additionally declares `write enable`, `read enable`,
 //! `byte write enable`, `write data coordinate` and `read data coordinate`,
@@ -31,7 +39,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::ops::Add;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Directory holding memory definitions, relative to the server working
@@ -45,12 +52,12 @@ const RAM_SUFFIX: &str = ".ram.txt";
 /// wider than this. Not a business limit, just what one integer can hold.
 const MAX_ADDRESS_BITS: usize = 63;
 
-/// A RAM writes its contents back every this often (or every
-/// [`FLUSH_WRITES`] writes, whichever comes first).
-const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
-const FLUSH_WRITES: usize = 4096;
-/// How many consecutive addresses share one written line.
-const FLUSH_GROUP: usize = 8;
+/// Largest number of points one coordinate line may expand to (BUG-022).
+const MAX_POINTS_PER_LINE: usize = 1024;
+
+/// Words per written line; also the alignment of every line start
+/// (BACKLOG.md BUG-021 rules 1-2).
+const WORDS_PER_LINE: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -72,6 +79,57 @@ pub enum Ports {
     },
 }
 
+/// Layout of a `matrix:` list, needed to align hex words. Every row is padded
+/// at its front to a whole number of hex digits (BACKLOG.md BUG-022).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MatrixShape {
+    /// Points along the fastest-changing (first) direction.
+    pub first: usize,
+    /// Number of rows: the product of the remaining directions.
+    pub rows: usize,
+}
+
+impl MatrixShape {
+    /// Hex digits one row occupies.
+    fn row_digits(&self) -> usize {
+        (self.first + 3) / 4
+    }
+
+    /// Width of one hex word in bits, per-row padding included.
+    fn padded_bits(&self) -> usize {
+        self.row_digits() * 4 * self.rows
+    }
+}
+
+/// One parsed `[ ... ]` list, already expanded into individual points.
+struct PortList {
+    /// Declared `width`.
+    width: usize,
+    points: Vec<BlockPos>,
+    /// Set when the list used the `matrix:` form.
+    matrix: Option<MatrixShape>,
+    /// Where each point came from, for duplicate reporting.
+    provenance: Vec<Provenance>,
+}
+
+#[derive(Clone, Copy)]
+struct Provenance {
+    line: usize,
+    ordinal: usize,
+    total: usize,
+}
+
+impl PortList {
+    fn empty() -> PortList {
+        PortList {
+            width: 0,
+            points: Vec::new(),
+            matrix: None,
+            provenance: Vec::new(),
+        }
+    }
+}
+
 /// A parsed memory definition.
 pub struct Memory {
     /// File name, used in log and chat messages.
@@ -83,6 +141,8 @@ pub struct Memory {
     pub clock: Option<BlockPos>,
     /// Word width in bits.
     pub bits: usize,
+    /// Set when the data list used `matrix:`; hex words are then padded per row.
+    pub matrix: Option<MatrixShape>,
     /// Contents. For a ROM this never changes after loading; for a RAM it is
     /// the live state that gets persisted.
     pub words: HashMap<usize, Vec<bool>>,
@@ -103,8 +163,6 @@ pub struct MemoryState {
     /// Everything before the first data line, verbatim (comments included).
     header: String,
     dirty: bool,
-    writes: usize,
-    last_flush: Instant,
 }
 
 impl MemoryState {
@@ -117,8 +175,6 @@ impl MemoryState {
             path,
             header,
             dirty: false,
-            writes: 0,
-            last_flush: Instant::now(),
         }
     }
 
@@ -138,12 +194,6 @@ impl MemoryState {
     pub fn reset_edges(&mut self) {
         self.prev_clk = false;
         self.prev_address = None;
-    }
-
-    /// Whether a RAM has unsaved contents and enough time/writes have passed.
-    pub fn flush_due(&self) -> bool {
-        self.dirty
-            && (self.writes >= FLUSH_WRITES || self.last_flush.elapsed() >= FLUSH_INTERVAL)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -176,13 +226,11 @@ impl MemoryState {
             return Err(format!("could not replace {}: {}", self.path.display(), err));
         }
         self.dirty = false;
-        self.writes = 0;
-        self.last_flush = Instant::now();
         Ok(())
     }
 
     /// Renders the file: the original header (first line rewritten to the
-    /// running kernel version) followed by the sparse data section.
+    /// running kernel version) followed by the data section.
     fn render(&self) -> String {
         let mut text = String::new();
         text.push_str(&format!("v{} hex words addressed\n", env!("CARGO_PKG_VERSION")));
@@ -193,69 +241,95 @@ impl MemoryState {
             text.push('\n');
         }
 
-        let mut addresses: Vec<usize> = self.memory.words.keys().copied().collect();
-        addresses.sort_unstable();
-        let mut index = 0;
-        while index < addresses.len() {
-            let start = addresses[index];
-            let mut end = index;
-            while end + 1 < addresses.len()
-                && addresses[end + 1] == addresses[end] + 1
-                && end + 1 - index < FLUSH_GROUP
-            {
-                end += 1;
-            }
-            text.push_str(&format!("{:x}:", start));
-            for address in &addresses[index..=end] {
+        // Logisim-compatible layout (BACKLOG.md BUG-021 rules 1-6): one line
+        // per 8-word block, the block start aligned to 8, always eight words,
+        // and every word as wide as the data bus. Blocks without a stored word
+        // are skipped entirely; readers treat those addresses as zero.
+        let address_digits = ((self.memory.address.len() + 3) / 4).max(1);
+        let zero_word = vec![false; self.memory.bits];
+        let mut blocks: Vec<usize> = self
+            .memory
+            .words
+            .keys()
+            .map(|address| address / WORDS_PER_LINE)
+            .collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        for block in blocks {
+            let start = block * WORDS_PER_LINE;
+            text.push_str(&format!("{:0width$x}:", start, width = address_digits));
+            for offset in 0..WORDS_PER_LINE {
+                let word = self
+                    .memory
+                    .words
+                    .get(&(start + offset))
+                    .unwrap_or(&zero_word);
                 text.push(' ');
-                text.push_str(&pack_word_hex(&self.memory.words[address]));
+                text.push_str(&pack_word_hex(word, self.memory.matrix));
             }
             text.push('\n');
-            index = end + 1;
         }
         text
     }
 
-    /// ROM: drive the data bus from the stored word, either on the clock's
-    /// rising edge or (no clock) whenever the address changes.
+    /// ROM: drive the data bus from the stored word, either on the rising edge
+    /// of the clock or (no clock) whenever the address changes.
     fn run_rom(&mut self, redpiler: &mut Compiler) {
-        let Ports::Rom { data } = &self.memory.ports else {
+        let Memory {
+            address,
+            clock,
+            words,
+            ports,
+            ..
+        } = &self.memory;
+        let Ports::Rom { data } = ports else {
             return;
         };
-        let Some(address) = read_address(redpiler, &self.memory.address) else {
+        let Some(value) = read_address(redpiler, &address[..]) else {
             return;
         };
-        let fire = match self.memory.clock {
+        let fire = match clock {
             Some(clk) => {
-                let Some((_, powered, _)) = redpiler.query_io(clk) else {
+                let Some((_, powered, _)) = redpiler.query_io(*clk) else {
                     return;
                 };
                 let edge = !self.prev_clk && powered;
                 self.prev_clk = powered;
                 edge
             }
-            None => self.prev_address != Some(address),
+            None => self.prev_address != Some(value),
         };
-        self.prev_address = Some(address);
+        self.prev_address = Some(value);
         if !fire {
             return;
         }
-        let width = self.memory.bits;
-        let word = self
-            .memory
-            .words
-            .get(&address)
-            .cloned()
-            .unwrap_or_else(|| vec![false; width]);
-        for (pos, bit) in data.iter().zip(word.iter()) {
-            let _ = redpiler.try_set_powered(*pos, *bit);
+        for (index, pos) in data.iter().enumerate() {
+            let bit = words
+                .get(&value)
+                .and_then(|word| word.get(index))
+                .copied()
+                .unwrap_or(false);
+            // Only touch nodes whose level actually changes, otherwise a wide
+            // data bus re-triggers every consumer on every tick
+            // (BACKLOG.md BUG-026).
+            if redpiler.query_io(*pos).map(|(_, powered, _)| powered) != Some(bit) {
+                let _ = redpiler.try_set_powered(*pos, bit);
+            }
         }
     }
 
-    /// RAM: on the clock's rising edge, sample the read side, drive the read
-    /// data bus with the OLD word, then apply the (byte-masked) write.
+    /// RAM: on the rising edge, sample the read side, drive the read data bus
+    /// with the OLD word, then apply the (byte-masked) write.
     fn run_ram(&mut self, redpiler: &mut Compiler) {
-        let Some(clk) = self.memory.clock else {
+        let Memory {
+            address,
+            clock,
+            bits,
+            words,
+            ports,
+            ..
+        } = &mut self.memory;
+        let Some(clk) = *clock else {
             return;
         };
         let Some((_, now, _)) = redpiler.query_io(clk) else {
@@ -267,73 +341,59 @@ impl MemoryState {
             return;
         }
 
-        // Copy the buses out of `self` so the writes below do not conflict with
-        // the borrow. This only runs on a clock edge.
-        let (address_bus, write_bus, read_bus, we, re, byte_bus, bits) = {
-            let Ports::Ram {
-                write_data,
-                read_data,
-                write_enable,
-                read_enable,
-                byte_enable,
-            } = &self.memory.ports
-            else {
-                return;
-            };
-            (
-                self.memory.address.clone(),
-                write_data.clone(),
-                read_data.clone(),
-                *write_enable,
-                *read_enable,
-                byte_enable.clone(),
-                self.memory.bits,
-            )
-        };
-
-        let Some(address) = read_address(redpiler, &address_bus) else {
+        let Ports::Ram {
+            write_data,
+            read_data,
+            write_enable,
+            read_enable,
+            byte_enable,
+        } = ports
+        else {
             return;
         };
-        let write_enabled = matches!(redpiler.query_io(we), Some((_, true, _)));
-        let read_enabled = matches!(redpiler.query_io(re), Some((_, true, _)));
 
-        // Read priority: the word is sampled before this edge's write applies.
+        let Some(value) = read_address(redpiler, &address[..]) else {
+            return;
+        };
+        let write_enabled = matches!(redpiler.query_io(*write_enable), Some((_, true, _)));
+        let read_enabled = matches!(redpiler.query_io(*read_enable), Some((_, true, _)));
+
+        // Read priority: the word is sampled before the write of this edge
+        // applies.
         if read_enabled {
-            let word = self
-                .memory
-                .words
-                .get(&address)
-                .cloned()
-                .unwrap_or_else(|| vec![false; bits]);
-            for (pos, bit) in read_bus.iter().zip(word.iter()) {
-                let _ = redpiler.try_set_powered(*pos, *bit);
+            for (index, pos) in read_data.iter().enumerate() {
+                let bit = words
+                    .get(&value)
+                    .and_then(|word| word.get(index))
+                    .copied()
+                    .unwrap_or(false);
+                if redpiler.query_io(*pos).map(|(_, powered, _)| powered) != Some(bit) {
+                    let _ = redpiler.try_set_powered(*pos, bit);
+                }
             }
         }
 
         if !write_enabled {
             return;
         }
-        let Some(new_word) = read_bits(redpiler, &write_bus) else {
+        let Some(new_word) = read_bits(redpiler, &write_data[..]) else {
             return;
         };
-        let enables: Vec<bool> = byte_bus
+        let enables: Vec<bool> = byte_enable
             .iter()
             .map(|pos| matches!(redpiler.query_io(*pos), Some((_, true, _))))
             .collect();
-        if !enables.is_empty() && enables.len() != (bits + 7) / 8 {
+        let width = *bits;
+        if !enables.is_empty() && enables.len() != (width + 7) / 8 {
             return;
         }
-        let old_word = self
-            .memory
-            .words
-            .get(&address)
-            .cloned()
-            .unwrap_or_else(|| vec![false; bits]);
-        let merged = merge_word(&old_word, &new_word, &enables);
-        if self.memory.words.get(&address) != Some(&merged) {
-            self.memory.words.insert(address, merged);
+        let merged = match words.get(&value) {
+            Some(old_word) => merge_word(old_word, &new_word, &enables),
+            None => merge_word(&vec![false; width], &new_word, &enables),
+        };
+        if words.get(&value) != Some(&merged) {
+            words.insert(value, merged);
             self.dirty = true;
-            self.writes += 1;
         }
     }
 }
@@ -706,7 +766,23 @@ fn merge_word(old: &[bool], new: &[bool], enables: &[bool]) -> Vec<bool> {
 
 /// Packs one word into hex the same way the protocol does: the bit vector as a
 /// single unsigned integer, zero-padded at the front (BACKLOG.md BUG-016).
-fn pack_word_hex(bits: &[bool]) -> String {
+fn pack_word_hex(bits: &[bool], matrix: Option<MatrixShape>) -> String {
+    let Some(shape) = matrix else {
+        return pack_bits_hex(bits);
+    };
+    let pad = (4 - shape.first % 4) % 4;
+    let mut padded: Vec<bool> = Vec::with_capacity(shape.padded_bits());
+    for row in 0..shape.rows {
+        padded.extend(std::iter::repeat(false).take(pad));
+        padded.extend_from_slice(&bits[row * shape.first..(row + 1) * shape.first]);
+    }
+    pack_bits_hex(&padded)
+}
+
+/// Packs a bit vector into hex, big-endian, padding the whole value at its
+/// front so the first digit carries only the leftover high bits
+/// (BACKLOG.md BUG-016).
+fn pack_bits_hex(bits: &[bool]) -> String {
     let mut hex = String::with_capacity(bits.len() / 4 + 1);
     let leftover = bits.len() % 4;
     let mut index = 0;
@@ -778,13 +854,13 @@ pub fn parse(name: &str, text: &str, kind: Kind) -> Result<(Memory, String), Str
     let mut origin: Option<BlockPos> = None;
     let mut clock: Option<BlockPos> = None;
     let mut clock_seen = false;
-    let mut address: Option<Vec<BlockPos>> = None;
-    let mut data: Option<Vec<BlockPos>> = None;
-    let mut write_data: Option<Vec<BlockPos>> = None;
-    let mut read_data: Option<Vec<BlockPos>> = None;
+    let mut address: Option<PortList> = None;
+    let mut data: Option<PortList> = None;
+    let mut write_data: Option<PortList> = None;
+    let mut read_data: Option<PortList> = None;
     let mut write_enable: Option<BlockPos> = None;
     let mut read_enable: Option<BlockPos> = None;
-    let mut byte_enable: Option<Vec<BlockPos>> = None;
+    let mut byte_enable: Option<PortList> = None;
     let mut data_start = count;
 
     while idx < count {
@@ -832,13 +908,7 @@ pub fn parse(name: &str, text: &str, kind: Kind) -> Result<(Memory, String), Str
                 if address.is_some() {
                     return Err(at_line(idx, "`address coordinate` is defined twice"));
                 }
-                address = Some(parse_list(
-                    &lines,
-                    &mut idx,
-                    value,
-                    count,
-                    "address coordinate",
-                )?);
+                address = Some(parse_list(&lines, &mut idx, value, count, "address coordinate")?);
             }
             "data coordinate" => {
                 if data.is_some() {
@@ -933,28 +1003,62 @@ pub fn parse(name: &str, text: &str, kind: Kind) -> Result<(Memory, String), Str
     }
     let origin = origin.ok_or("`origin` is required (use `origin = 0` for world coordinates)")?;
     let address = address.ok_or("`address coordinate` is required")?;
-    if address.len() > MAX_ADDRESS_BITS {
+    if address.width == 0 {
+        return Err("`address coordinate`: `width` must be greater than 0".into());
+    }
+    if address.points.len() > MAX_ADDRESS_BITS {
         return Err(format!(
             "address bus is {} bits wide, the maximum is {}",
-            address.len(),
+            address.points.len(),
             MAX_ADDRESS_BITS
         ));
     }
     if kind == Kind::Ram && clock.is_none() {
         return Err("a RAM requires a clock element: `clk = 0` is not allowed".into());
     }
+    let byte_enable = byte_enable.unwrap_or_else(PortList::empty);
 
-    let (bits, ports) = match kind {
+    // Two bit positions may never alias (BACKLOG.md BUG-022 rule 5).
+    {
+        let mut lists: Vec<(&str, &PortList)> = vec![("address coordinate", &address)];
+        match kind {
+            Kind::Rom => {
+                if let Some(list) = data.as_ref() {
+                    lists.push(("data coordinate", list));
+                }
+            }
+            Kind::Ram => {
+                if let Some(list) = write_data.as_ref() {
+                    lists.push(("write data coordinate", list));
+                }
+                if let Some(list) = read_data.as_ref() {
+                    lists.push(("read data coordinate", list));
+                }
+            }
+        }
+        if !byte_enable.points.is_empty() {
+            lists.push(("byte write enable", &byte_enable));
+        }
+        check_duplicates(&lists)?;
+    }
+
+    let (bits, matrix, ports) = match kind {
         Kind::Rom => {
             if write_data.is_some() || read_data.is_some() {
                 return Err("a ROM does not take `write`/`read data coordinate`".into());
             }
             let data = data.ok_or("`data coordinate` is required")?;
-            if data.is_empty() {
-                return Err("`data coordinate` must not be empty".into());
+            if data.width == 0 {
+                return Err("`data coordinate`: `width` must be greater than 0".into());
             }
-            let bits = data.len();
-            (bits, Ports::Rom { data: offset_all(data, origin) })
+            let bits = data.width;
+            (
+                bits,
+                data.matrix,
+                Ports::Rom {
+                    data: offset_all(data.points, origin),
+                },
+            )
         }
         Kind::Ram => {
             if data.is_some() {
@@ -965,45 +1069,53 @@ pub fn parse(name: &str, text: &str, kind: Kind) -> Result<(Memory, String), Str
             }
             let write_data = write_data.ok_or("`write data coordinate` is required")?;
             let read_data = read_data.ok_or("`read data coordinate` is required")?;
-            if write_data.is_empty() {
-                return Err("`write data coordinate` must not be empty".into());
+            if write_data.width == 0 {
+                return Err(
+                    "`write data coordinate`: `width` must be greater than 0".into(),
+                );
             }
-            if write_data.len() != read_data.len() {
+            if read_data.width == 0 {
+                return Err("`read data coordinate`: `width` must be greater than 0".into());
+            }
+            if write_data.width != read_data.width {
                 return Err(format!(
-                    "`write data coordinate` has {} entries but `read data coordinate` has {}",
-                    write_data.len(),
-                    read_data.len()
+                    "`write data coordinate` declares width {} but `read data coordinate` declares width {}",
+                    write_data.width, read_data.width
                 ));
             }
-            let bits = write_data.len();
+            if write_data.matrix != read_data.matrix {
+                return Err(
+                    "`write data coordinate` and `read data coordinate` must both use `matrix:` with the same shape, or neither"
+                        .into(),
+                );
+            }
+            let bits = write_data.width;
+            let expected = (bits + 7) / 8;
+            if byte_enable.width != 0 && byte_enable.width != expected {
+                return Err(format!(
+                    "`byte write enable` declares width {} but {} data bits need {} group(s)",
+                    byte_enable.width, bits, expected
+                ));
+            }
             let write_enable = write_enable.ok_or("`write enable` is required")?;
             let read_enable = read_enable.ok_or("`read enable` is required")?;
-            let byte_enable = byte_enable.unwrap_or_default();
-            let expected = (bits + 7) / 8;
-            if !byte_enable.is_empty() && byte_enable.len() != expected {
-                return Err(format!(
-                    "`byte write enable` has {} entries but {} data bits need {}",
-                    byte_enable.len(),
-                    bits,
-                    expected
-                ));
-            }
             (
                 bits,
+                write_data.matrix,
                 Ports::Ram {
-                    write_data: offset_all(write_data, origin),
-                    read_data: offset_all(read_data, origin),
+                    write_data: offset_all(write_data.points, origin),
+                    read_data: offset_all(read_data.points, origin),
                     write_enable: write_enable.add(origin),
                     read_enable: read_enable.add(origin),
-                    byte_enable: offset_all(byte_enable, origin),
+                    byte_enable: offset_all(byte_enable.points, origin),
                 },
             )
         }
     };
 
-    let address = offset_all(address, origin);
+    let address = offset_all(address.points, origin);
     let clock = clock.map(|pos| pos.add(origin));
-    let words = parse_words(&lines, data_start, bits)?;
+    let words = parse_words(&lines, data_start, bits, matrix)?;
 
     Ok((
         Memory {
@@ -1012,6 +1124,7 @@ pub fn parse(name: &str, text: &str, kind: Kind) -> Result<(Memory, String), Str
             address,
             clock,
             bits,
+            matrix,
             words,
             ports,
         },
@@ -1058,16 +1171,18 @@ fn parse_single_or_triple(value: &str) -> Result<Coordinate, String> {
     }
 }
 
-/// Parses a `[ ... ]` coordinate list. The opening bracket may sit on the same
-/// line as the `=` or on a later one (BACKLOG.md BUG-015). `idx` is advanced to
-/// the last line the list consumed.
+/// Parses a `[ ... ]` list. The opening bracket may sit on the same line as
+/// the `=` or on a later one (BACKLOG.md BUG-015). The first entry must be
+/// `width = N` (BUG-023); the remaining entries are coordinates, either one
+/// per line (`x, y, z` or `x, y, z, step, count`) or a single `matrix:` line.
+/// `idx` is advanced to the last line the list consumed.
 fn parse_list(
     lines: &[&str],
     idx: &mut usize,
     value: &str,
     count: usize,
     key: &str,
-) -> Result<Vec<BlockPos>, String> {
+) -> Result<PortList, String> {
     let mut buffer = String::new();
     let mut opened = false;
     let mut closed = false;
@@ -1077,7 +1192,10 @@ fn parse_list(
     while !opened && !closed {
         *idx += 1;
         if *idx >= count {
-            return Err(format!("`{}`: expected `[` after the key", key));
+            return Err(at_line(
+                start_index,
+                format!("`{}`: expected `[` after the key", key),
+            ));
         }
         feed_list(lines[*idx], &mut buffer, &mut opened, &mut closed);
     }
@@ -1092,28 +1210,345 @@ fn parse_list(
         feed_list(lines[*idx], &mut buffer, &mut opened, &mut closed);
     }
 
-    let mut points = Vec::new();
+    let mut entries: Vec<(usize, &str)> = Vec::new();
     for (offset, line) in buffer.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let index = start_index + offset;
-        let parts: Vec<&str> = line.split(',').map(|part| part.trim()).collect();
-        let [x, y, z] = parts.as_slice() else {
+        entries.push((start_index + offset, line));
+    }
+
+    let Some(&(width_index, width_text)) = entries.first() else {
+        return Err(at_line(
+            start_index,
+            format!("`{}`: the list is empty, the first entry must be `width = N`", key),
+        ));
+    };
+    let width = parse_width(width_text, width_index, key)?;
+    let body = &entries[1..];
+
+    if width == 0 {
+        if !body.is_empty() {
             return Err(at_line(
-                index,
-                format!("`{}`: coordinate `{}` must be a triple `x, y, z`", key, line),
+                body[0].0,
+                format!(
+                    "`{}`: `width = 0` means an empty list, but {} more line(s) follow",
+                    key,
+                    body.len()
+                ),
             ));
-        };
-        points.push(BlockPos::new(
-            parse_i32(x).map_err(|err| at_line(index, format!("`{}`: {}", key, err)))?,
-            parse_i32(y).map_err(|err| at_line(index, format!("`{}`: {}", key, err)))?,
-            parse_i32(z).map_err(|err| at_line(index, format!("`{}`: {}", key, err)))?,
+        }
+        return Ok(PortList::empty());
+    }
+
+    let Some(&(first_index, first_text)) = body.first() else {
+        return Err(at_line(
+            width_index,
+            format!("`{}`: `width = {}` but the list has no coordinates", key, width),
+        ));
+    };
+
+    let mut points: Vec<BlockPos> = Vec::new();
+    let mut provenance: Vec<Provenance> = Vec::new();
+    let mut matrix = None;
+
+    if let Some(rest) = strip_matrix_prefix(first_text) {
+        if body.len() > 1 {
+            return Err(at_line(
+                body[1].0,
+                format!("`{}`: a `matrix:` list must be a single line", key),
+            ));
+        }
+        let (expanded, shape) = expand_matrix(rest, first_index, key)?;
+        let total = expanded.len();
+        for (ordinal, pos) in expanded.into_iter().enumerate() {
+            provenance.push(Provenance {
+                line: first_index,
+                ordinal: ordinal + 1,
+                total,
+            });
+            points.push(pos);
+        }
+        matrix = Some(shape);
+    } else {
+        for &(index, text) in body {
+            let expanded = expand_line(text, index, key)?;
+            let total = expanded.len();
+            for (ordinal, pos) in expanded.into_iter().enumerate() {
+                provenance.push(Provenance {
+                    line: index,
+                    ordinal: ordinal + 1,
+                    total,
+                });
+                points.push(pos);
+            }
+        }
+    }
+
+    if points.len() != width {
+        return Err(at_line(
+            width_index,
+            format!(
+                "`{}`: `width = {}` but the list expands to {} coordinate(s)",
+                key,
+                width,
+                points.len()
+            ),
         ));
     }
-    Ok(points)
+
+    Ok(PortList {
+        width,
+        points,
+        matrix,
+        provenance,
+    })
 }
+
+/// Reads the mandatory `width = N` entry.
+fn parse_width(text: &str, index: usize, key: &str) -> Result<usize, String> {
+    let Some((name, value)) = text.split_once('=') else {
+        return Err(at_line(
+            index,
+            format!("`{}`: the first entry must be `width = N`, found `{}`", key, text),
+        ));
+    };
+    if name.trim() != "width" {
+        return Err(at_line(
+            index,
+            format!("`{}`: the first entry must be `width = N`, found `{}`", key, text),
+        ));
+    }
+    let value = value.trim();
+    value.parse::<usize>().map_err(|_| {
+        at_line(
+            index,
+            format!("`{}`: `width` must be a whole number, found `{}`", key, value),
+        )
+    })
+}
+
+/// Recognises the case-insensitive `matrix:` prefix.
+fn strip_matrix_prefix(text: &str) -> Option<&str> {
+    let colon = text.find(':')?;
+    if !text[..colon].trim().eq_ignore_ascii_case("matrix") {
+        return None;
+    }
+    Some(text[colon + 1..].trim())
+}
+
+/// Expands one coordinate line: either a single point or one axis step.
+fn expand_line(text: &str, index: usize, key: &str) -> Result<Vec<BlockPos>, String> {
+    let parts: Vec<&str> = text.split(',').map(|part| part.trim()).collect();
+    let base = parse_triple(&parts, index, key)?;
+    match parts.len() {
+        3 => Ok(vec![base]),
+        5 => {
+            let (axis, step) = parse_step(parts[3], index, key)?;
+            let count = parse_count(parts[4], index, key)?;
+            Ok(expand_axes(base, &[axis], &[step], &[count]))
+        }
+        _ => Err(at_line(
+            index,
+            format!(
+                "`{}`: coordinate `{}` must have 3 parts (`x, y, z`) or 5 (`x, y, z, step, count`)",
+                key, text
+            ),
+        )),
+    }
+}
+
+/// Expands a `matrix:` line: origin plus one to three `step, count` pairs.
+fn expand_matrix(text: &str, index: usize, key: &str) -> Result<(Vec<BlockPos>, MatrixShape), String> {
+    let parts: Vec<&str> = text.split(',').map(|part| part.trim()).collect();
+    if parts.len() < 5 || parts.len() > 9 || (parts.len() - 3) % 2 != 0 {
+        return Err(at_line(
+            index,
+            format!(
+                "`{}`: `matrix:` takes an origin plus 1 to 3 `step, count` pairs, found `{}`",
+                key, text
+            ),
+        ));
+    }
+    let base = parse_triple(&parts, index, key)?;
+    let segments = (parts.len() - 3) / 2;
+    let mut axes = Vec::with_capacity(segments);
+    let mut steps = Vec::with_capacity(segments);
+    let mut counts = Vec::with_capacity(segments);
+    for n in 0..segments {
+        let (axis, step) = parse_step(parts[3 + n * 2], index, key)?;
+        let count = parse_count(parts[4 + n * 2], index, key)?;
+        axes.push(axis);
+        steps.push(step);
+        counts.push(count);
+    }
+    let points = expand_axes(base, &axes, &steps, &counts);
+    let first = counts[0];
+    let rows: usize = counts[1..].iter().product();
+    Ok((points, MatrixShape { first, rows }))
+}
+
+/// Row-major expansion with the first direction changing fastest.
+fn expand_axes(base: BlockPos, axes: &[usize], steps: &[i64], counts: &[usize]) -> Vec<BlockPos> {
+    let total: usize = counts.iter().product();
+    let mut points = Vec::with_capacity(total);
+    for flat in 0..total {
+        let mut rest = flat;
+        let mut pos = base;
+        for n in 0..axes.len() {
+            let index = rest % counts[n];
+            rest /= counts[n];
+            let amount = steps[n].saturating_mul(index as i64);
+            pos = shift_axis(pos, axes[n], amount);
+        }
+        points.push(pos);
+    }
+    points
+}
+
+fn shift_axis(pos: BlockPos, axis: usize, amount: i64) -> BlockPos {
+    let mut x = i64::from(pos.x);
+    let mut y = i64::from(pos.y);
+    let mut z = i64::from(pos.z);
+    match axis {
+        0 => x = x.saturating_add(amount),
+        1 => y = y.saturating_add(amount),
+        _ => z = z.saturating_add(amount),
+    }
+    BlockPos::new(x as i32, y as i32, z as i32)
+}
+
+/// Parses a step token such as `+2x` or `-3Y`. The sign is mandatory and the
+/// magnitude must be 1 to 255.
+fn parse_step(token: &str, index: usize, key: &str) -> Result<(usize, i64), String> {
+    let (sign, rest) = match token.chars().next() {
+        Some('+') => (1i64, &token[1..]),
+        Some('-') => (-1i64, &token[1..]),
+        _ => {
+            return Err(at_line(
+                index,
+                format!("`{}`: step `{}` must start with `+` or `-`", key, token),
+            ))
+        }
+    };
+    if rest.len() < 2 {
+        return Err(at_line(
+            index,
+            format!("`{}`: step `{}` must look like `+2x`", key, token),
+        ));
+    }
+    let (digits, axis_text) = rest.split_at(rest.len() - 1);
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(at_line(
+            index,
+            format!("`{}`: step `{}` must look like `+2x`", key, token),
+        ));
+    }
+    let magnitude: i64 = digits.parse().map_err(|_| {
+        at_line(
+            index,
+            format!("`{}`: step `{}` is out of range (1 to 255)", key, token),
+        )
+    })?;
+    if magnitude == 0 {
+        return Err(at_line(
+            index,
+            format!("`{}`: step `{}` must not be zero", key, token),
+        ));
+    }
+    if magnitude > 255 {
+        return Err(at_line(
+            index,
+            format!("`{}`: step `{}` is out of range (1 to 255)", key, token),
+        ));
+    }
+    let axis = match axis_text.to_ascii_lowercase().as_str() {
+        "x" => 0usize,
+        "y" => 1,
+        "z" => 2,
+        _ => {
+            return Err(at_line(
+                index,
+                format!("`{}`: step `{}` must end with `x`, `y` or `z`", key, token),
+            ))
+        }
+    };
+    Ok((axis, sign * magnitude))
+}
+
+/// Parses the `count` field: plain digits only, 1 to `MAX_POINTS_PER_LINE`.
+fn parse_count(text: &str, index: usize, key: &str) -> Result<usize, String> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(at_line(
+            index,
+            format!("`{}`: count `{}` must be a plain whole number", key, text),
+        ));
+    }
+    let count: usize = text.parse().map_err(|_| {
+        at_line(
+            index,
+            format!("`{}`: count `{}` is too large", key, text),
+        )
+    })?;
+    if count == 0 {
+        return Err(at_line(
+            index,
+            format!("`{}`: count must be at least 1", key),
+        ));
+    }
+    if count > MAX_POINTS_PER_LINE {
+        return Err(at_line(
+            index,
+            format!(
+                "`{}`: count {} exceeds the limit of {}",
+                key, count, MAX_POINTS_PER_LINE
+            ),
+        ));
+    }
+    Ok(count)
+}
+
+fn parse_triple(parts: &[&str], index: usize, key: &str) -> Result<BlockPos, String> {
+    let (Some(x), Some(y), Some(z)) = (parts.first(), parts.get(1), parts.get(2)) else {
+        return Err(at_line(
+            index,
+            format!("`{}`: a coordinate needs `x, y, z`", key),
+        ));
+    };
+    Ok(BlockPos::new(
+        parse_i32(x).map_err(|err| at_line(index, format!("`{}`: {}", key, err)))?,
+        parse_i32(y).map_err(|err| at_line(index, format!("`{}`: {}", key, err)))?,
+        parse_i32(z).map_err(|err| at_line(index, format!("`{}`: {}", key, err)))?,
+    ))
+}
+
+/// Rejects two bit positions that resolve to the same coordinate.
+fn check_duplicates(lists: &[(&str, &PortList)]) -> Result<(), String> {
+    let mut seen: HashMap<BlockPos, usize> = HashMap::new();
+    for (key, list) in lists {
+        for (pos, prov) in list.points.iter().zip(list.provenance.iter()) {
+            if let Some(previous_line) = seen.get(pos) {
+                return Err(at_line(
+                    prov.line,
+                    format!(
+                        "`{}`: element {} of {} expands to ({}, {}, {}), which duplicates line {}",
+                        key,
+                        prov.ordinal,
+                        prov.total,
+                        pos.x,
+                        pos.y,
+                        pos.z,
+                        previous_line + 1
+                    ),
+                ));
+            }
+            seen.insert(*pos, prov.line);
+        }
+    }
+    Ok(())
+}
+
 fn feed_list(text: &str, buffer: &mut String, opened: &mut bool, closed: &mut bool) {
     if *closed {
         return;
@@ -1145,6 +1580,7 @@ fn parse_words(
     lines: &[&str],
     start: usize,
     bits: usize,
+    matrix: Option<MatrixShape>,
 ) -> Result<HashMap<usize, Vec<bool>>, String> {
     let mut words: HashMap<usize, Vec<bool>> = HashMap::new();
     let mut next: usize = 0;
@@ -1166,7 +1602,7 @@ fn parse_words(
             tokens.extend(line.split_whitespace());
         }
         for token in tokens {
-            let word = parse_word(token, bits).map_err(|err| at_line(index, err))?;
+            let word = parse_word(token, bits, matrix).map_err(|err| at_line(index, err))?;
             words.insert(next, word);
             next = next
                 .checked_add(1)
@@ -1175,6 +1611,55 @@ fn parse_words(
     }
     Ok(words)
 }
+
+/// Decodes one hex word. Shorter input is zero-padded at the front and longer
+/// input keeps its low bits, matching the pre-0.4.2 behaviour (BUG-022 规则 22).
+/// A `matrix` word is padded per row first and the padding is then stripped.
+fn parse_word(
+    word: &str,
+    bits: usize,
+    matrix: Option<MatrixShape>,
+) -> Result<Vec<bool>, String> {
+    let text = word.trim();
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    if text.is_empty() {
+        return Err("empty word".into());
+    }
+    let mut raw = Vec::with_capacity(text.len() * 4);
+    for ch in text.chars() {
+        let digit = ch
+            .to_digit(16)
+            .ok_or_else(|| format!("`{}` is not a hexadecimal word", word))?;
+        for shift in (0..4).rev() {
+            raw.push(digit & (1 << shift) != 0);
+        }
+    }
+    let Some(shape) = matrix else {
+        return Ok(right_align(&raw, bits));
+    };
+    let padded = right_align(&raw, shape.padded_bits());
+    let pad = (4 - shape.first % 4) % 4;
+    let row_bits = pad + shape.first;
+    let mut out = Vec::with_capacity(bits);
+    for row in 0..shape.rows {
+        let base = row * row_bits + pad;
+        out.extend_from_slice(&padded[base..base + shape.first]);
+    }
+    Ok(out)
+}
+
+/// Right-aligns `raw` into a `width`-bit vector: short input gains leading
+/// zeros, long input loses its leading bits.
+fn right_align(raw: &[bool], width: usize) -> Vec<bool> {
+    let mut out = vec![false; width];
+    let take = raw.len().min(width);
+    out[width - take..].copy_from_slice(&raw[raw.len() - take..]);
+    out
+}
+
 fn parse_i32(text: &str) -> Result<i32, String> {
     text.parse()
         .map_err(|_| format!("`{}` is not a whole number", text))
@@ -1190,34 +1675,6 @@ fn parse_hex_u64(text: &str) -> Result<u64, ()> {
         return Err(());
     }
     u64::from_str_radix(text, 16).map_err(|_| ())
-}
-
-/// Parses one Logisim word into `width` bits, most significant bit first. A
-/// word wider than the bus keeps only its low bits; a narrower one is
-/// zero-extended at the top.
-fn parse_word(word: &str, width: usize) -> Result<Vec<bool>, String> {
-    let text = word.trim();
-    let text = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-        .unwrap_or(text);
-    if text.is_empty() {
-        return Err("empty word".into());
-    }
-    let mut bits = Vec::with_capacity(text.len() * 4);
-    for ch in text.chars() {
-        let digit = ch
-            .to_digit(16)
-            .ok_or_else(|| format!("`{}` is not a hexadecimal word", word))?;
-        for shift in (0..4).rev() {
-            bits.push(digit & (1 << shift) != 0);
-        }
-    }
-    let mut out = vec![false; width];
-    let take = bits.len().min(width);
-    let offset = width - take;
-    out[offset..].copy_from_slice(&bits[bits.len() - take..]);
-    Ok(out)
 }
 
 /// Whether a line starts the Logisim payload (`1f: 00 0a ...`).

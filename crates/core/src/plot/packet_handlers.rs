@@ -255,7 +255,12 @@ impl ServerBoundPacketHandler for Plot {
             player_position_and_rotation.z,
         );
         self.players[player].pos = new;
-        self.players[player].yaw = player_position_and_rotation.yaw;
+        // The client sends yaw unnormalized (it can arrive as e.g. 9820.04,
+        // after many turns). Narrowing that later saturates and pinned the
+        // sign rotation to 15 (BACKLOG.md BUG-024), so normalize once on the
+        // way in and make every consumer see [0, 360).
+        let yaw = player_position_and_rotation.yaw.rem_euclid(360.0);
+        self.players[player].yaw = yaw;
         self.players[player].pitch = player_position_and_rotation.pitch;
         self.players[player].on_ground = player_position_and_rotation.on_ground;
         let packet = if (new.x - old.x).abs() > 8.0
@@ -281,7 +286,7 @@ impl ServerBoundPacketHandler for Plot {
                 delta_y,
                 delta_z,
                 pitch: player_position_and_rotation.pitch,
-                yaw: player_position_and_rotation.yaw,
+                yaw,
                 entity_id: self.players[player].entity_id as i32,
                 on_ground: player_position_and_rotation.on_ground,
             }
@@ -289,7 +294,7 @@ impl ServerBoundPacketHandler for Plot {
         };
         let entity_head_look = CSetHeadRotation {
             entity_id: self.players[player].entity_id as i32,
-            head_yaw: player_position_and_rotation.yaw,
+            head_yaw: yaw,
         }
         .encode();
         for other_player in 0..self.players.len() {
@@ -305,19 +310,22 @@ impl ServerBoundPacketHandler for Plot {
     }
 
     fn handle_player_rotation(&mut self, player_rotation: SPlayerRotation, player: usize) {
-        self.players[player].yaw = player_rotation.yaw;
+        // Same normalization as `handle_set_player_position_and_rotation`
+        // (BACKLOG.md BUG-024).
+        let yaw = player_rotation.yaw.rem_euclid(360.0);
+        self.players[player].yaw = yaw;
         self.players[player].pitch = player_rotation.pitch;
         self.players[player].on_ground = player_rotation.on_ground;
         let rotation_packet = CEntityRotation {
             entity_id: self.players[player].entity_id as i32,
-            yaw: player_rotation.yaw,
+            yaw,
             pitch: player_rotation.pitch,
             on_ground: player_rotation.on_ground,
         }
         .encode();
         let entity_head_look = CSetHeadRotation {
             entity_id: self.players[player].entity_id as i32,
-            head_yaw: player_rotation.yaw,
+            head_yaw: yaw,
         }
         .encode();
         for other_player in 0..self.players.len() {

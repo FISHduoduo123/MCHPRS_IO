@@ -27,7 +27,7 @@ The `MCHPRS_IO/` folder in this repository contains a complete, ready-to-run dem
 
 - Multithreaded redstone server for Minecraft 1.20.4 creative mode
 - Redpiler redstone compiler
-- Automation protocol (TCP port 25585, plain text, protocol version 0.4.0-beta):
+- Automation protocol (TCP port 25585, plain text, protocol version 0.4.3-beta):
   - `PIN` / `POUT` data ports expose redstone regions as hex values; the
     hex is the whole bit vector as one integer, zero-padded at the front
     (changed in 0.4.0-beta)
@@ -120,14 +120,16 @@ A memory is defined by a text file in `memory/`, next to `Config.toml`.
 that directory is loaded at startup.
 
 ```text
-v0.4.1-beta hex words addressed
+v0.4.3-beta hex words addressed
 origin = 0
 clk = 0
 address coordinate = [
+width = 2
 -8, 64, 0
 -7, 64, 0
 ]
 data coordinate = [
+width = 2
 2, 64, 0
 3, 64, 0
 ]
@@ -140,10 +142,25 @@ data coordinate = [
   value changes. `clk = x, y, z` reads once per rising edge of that element.
 - `origin = 0` (or `0, 0, 0`) keeps coordinates absolute; any other triple is
   added to every coordinate, `clk` included. Keys may appear in any order.
+- The **first entry of every list must be `width = N`**, declaring how many
+  coordinates that list expands to; a mismatch rejects the whole file. An empty
+  list `[ ]` is an error as well.
 - `address coordinate` entries must be redstone lamps, trapdoors or note
   blocks; `data coordinate` entries must be levers or pressure plates. The
   first entry of each list is the **most significant** bit; bus width is not
   limited to a multiple of four.
+- A line is either a single coordinate `x, y, z` or a **step expansion**
+  `x, y, z, +2x, 4`: the sign is mandatory, the axis must be x, y or z (either
+  case), the step magnitude is 1-255 and the count is 1-1024 written as plain
+  digits.
+- `matrix: x, y, z, +1x, 3, +1y, 5` expands up to three directions at once
+  (row major, first direction fastest), and such a list must occupy exactly one
+  line. It aligns the hex words by padding every row at its front with
+  `(4 - first % 4) % 4` zeros, so one word needs
+  `ceil(first/4) * product(remaining counts)` hex digits.
+- Any two bits of the same memory that resolve to the same coordinate are an
+  error, reported with line, expansion index, coordinate and the clashing
+  line.
 - The payload is the Logisim `v3.0 hex words addressed` format: `addr: word
   word ...`. Words are separated by spaces or newlines, `#` / `//` / `/* */`
   comments are accepted everywhere, unlisted addresses read as 0, and a word
@@ -165,28 +182,31 @@ data coordinate = [
 A RAM keeps its contents in the server and writes them back to the same file.
 
 ```text
-v0.4.1-beta hex words addressed
+v0.4.3-beta hex words addressed
 origin = 0
 clk = 12, 37, 76                  // mandatory; drives both read and write
 write enable = 43, 46, 25
 read enable = 81, 66, 48
-byte write enable = [             // empty list = write the whole word
+byte write enable = [             // use width = 0 when there is none
+width = 1
 26, 67, 94
-26, 67, 97
 ]
 address coordinate = [
+width = 2
 258, 10, 263
 258, 8, 263
 ]
 write data coordinate = [         // driven by the circuit (lamps)
+width = 2
 256, 14, 264
 256, 12, 264
 ]
 read data coordinate = [          // driven by the server (levers)
+width = 2
 256, 34, 264
 256, 32, 264
 ]
-00: f b
+0: 3 1 0 0 0 0 0 0
 ```
 
 - The clock is mandatory and drives both halves. Everything is latched on its
@@ -199,9 +219,14 @@ read data coordinate = [          // driven by the server (levers)
   bits, a disabled group keeps the old value.
 - Read priority: when read and write enable are both high on the same edge, the
   read data bus carries the **old** word while the write is applied.
-- Contents are written back to the same file (header and comments preserved,
-  first line updated to the running version) every two seconds or every 4096
-  writes, and on `/stop`, on a compile crash and before `/memory reload`.
+- Contents are written back to the same file (header preserved, first line
+  updated to the running version). The data section is Logisim compatible:
+  each line holds exactly 8 words, its address is aligned to 8 and written
+  with as many hex digits as the address bus is wide, and blocks without any
+  stored word are omitted (their addresses read back as zero). Nothing is
+  written during normal operation: the file is saved when a player leaves the
+  server, on shutdown, on `/redpiler reset`, on a compile crash and before
+  `/memory reload`.
 - A read data lever must not be driven by the circuit: the memory would fight
   it. This is checked when the memory is validated.
 
@@ -231,7 +256,7 @@ python3 MCHPRS_IO/test.py
 The demo registers an 8-bit adder (`PIN add_in` input port, `POUT add_out` output port) over the automation protocol and verifies it against input vectors. You will see output like:
 
 ```text
-<- HELLO MCHPRS AUTOMATION 0.4.0-beta
+<- HELLO MCHPRS AUTOMATION 0.4.3-beta
 [25] passed=25 failed=0 rate=10/s
 ...
 done. total=500 passed=500 failed=0 elapsed=50.1s rate=10/s

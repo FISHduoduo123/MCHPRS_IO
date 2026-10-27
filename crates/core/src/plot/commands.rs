@@ -283,8 +283,7 @@ impl Plot {
             }
             "radv" | "radvance" => {
                 let ticks: u32 = args.first().and_then(|arg| arg.parse().ok()).ok_or("ARG")?;
-                self.tickn(u64::from(ticks));
-                self.publish_world();
+                self.advance_ticks(u64::from(ticks));
                 Ok(())
             }
             "memory" => match args.first().copied() {
@@ -388,8 +387,7 @@ impl Plot {
                     return false;
                 };
                 let start_time = Instant::now();
-                self.tickn(ticks as u64);
-                self.publish_world();
+                self.advance_ticks(u64::from(ticks));
                 self.players[player].send_system_message(&format!(
                     "Plot has been advanced by {} ticks ({:?})",
                     ticks,

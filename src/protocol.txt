@@ -15,9 +15,9 @@
  - Maximum line length: 4096 bytes.
  - On connect, the server greets the client with:
 
-        HELLO MCHPRS AUTOMATION 0.4.0-beta
+        HELLO MCHPRS AUTOMATION 0.4.3-beta
 
-    where 0.4.0-beta is the protocol version.
+    where 0.4.3-beta is the protocol version.
  - Multiple connections are supported and are fully independent.
  - Closing the connection removes all subscriptions and data ports registered
    by that connection.
@@ -316,7 +316,7 @@ sampled on that edge. When the trigger fires, the server pushes an
 
  9. Example session
  ------------------
-    S: HELLO MCHPRS AUTOMATION 0.4.0-beta
+    S: HELLO MCHPRS AUTOMATION 0.4.3-beta
     C: READ 128 63 2048
    S: OK READ 128 63 2048 1 0
    C: USE 128 63 2048
@@ -394,16 +394,21 @@ automation_data_port_events (Config.toml, default false):
 
  12. Memory files (since 0.4.0-beta)
  -----------------------------------
- The server can drive redstone from read-only memories defined by text files
- in the `memory/` directory next to Config.toml. Every `*.rom.txt` file is
- loaded at startup; `*.ram.txt` is reserved and currently ignored. The file
- format is documented in the README ("Memory files (ROM)"); this section only
- records what scripts need to know.
+ The server can drive redstone from memories defined by text files in the
+ `memory/` directory next to Config.toml. Every `*.rom.txt` and `*.ram.txt`
+ file is loaded at startup. The file format is documented in the README
+ ("Memory files (ROM and RAM)"); this section only records what scripts need
+ to know.
+
+ Since 0.4.2-beta every port list must start with `width = N`; coordinate lines
+ support step expansion (`x, y, z, +2x, 4`) and the `matrix:` form (per-row
+ padding to align hex words). An empty list `[ ]` is no longer valid; write
+ `byte write enable = [ width = 0 ]` when there is no byte enable.
 
  - Memories are a server-side feature: the automation protocol itself is
    unchanged, and there is no MEMORY verb.
  - The first line of a memory file must name the running kernel version
-   (currently v0.4.0-beta). A file whose first line does not match is
+   (currently v0.4.3-beta). A file whose first line does not match is
    rejected: the server logs the reason and keeps running without it.
  - A memory is validated after every successful compile. Elements that do not
    resolve (wrong block type, outside the plot, or no compiled circuit) disable
@@ -422,7 +427,12 @@ automation_data_port_events (Config.toml, default false):
    `read data coordinate`, and its `clk` is mandatory. It is latched on the
    clock's rising edge with one tick latency; when read and write enable are
    both high the read data bus carries the old word. Contents are persisted by
-   writing the same file back (header preserved, sparse data section, first
-   line updated to the running kernel version) every two seconds, every 4096
-   writes, and on shutdown, crash and reload. The automation protocol itself is
+   writing the same file back (header preserved, first line updated to the
+   running kernel version). The data section is Logisim compatible: each line
+   holds 8 words, its address is aligned to 8 and written with as many hex
+   digits as the address bus is wide, and blocks without any stored word are
+   omitted (those addresses read back as zero). Nothing is written during
+   normal operation (since 0.4.2-beta): the file is saved on shutdown, on
+   `/redpiler reset`, on a compile crash, when a player leaves the server and
+   before `/memory reload` only, so a large RAM can never stall a tick. The automation protocol itself is
    unchanged by memories: there is still no MEMORY verb.
